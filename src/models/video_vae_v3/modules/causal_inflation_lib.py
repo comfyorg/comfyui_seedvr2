@@ -14,7 +14,6 @@
 
 import math
 from contextlib import contextmanager
-import time
 from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
@@ -27,6 +26,7 @@ from .context_parallel_lib import cache_send_recv, get_cache_size
 from .global_config import get_norm_limit
 from .types import MemoryState, _inflation_mode_t, _memory_device_t
 from ....common.half_precision_fixes import safe_pad_operation
+from ....optimization.memory_manager import clear_memory, retry_on_oom
 
 # Single GPU inference - no distributed processing needed
 #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
@@ -46,7 +46,6 @@ def get_next_sequence_parallel_rank():
 
 def get_prev_sequence_parallel_rank():
     return 0
-
 
 @contextmanager
 def ignore_padding(model):
@@ -102,11 +101,20 @@ class InflatedCausalConv3d(Conv3d):
         shape[-3:] += torch.tensor(padding).view(3, 2).sum(-1).flip(0)
         memory_occupy = shape.prod() * x.element_size() / 1024**3  # GiB
         if memory_occupy < self.memory_limit or split_dim == x.ndim:
+            x_concat = x
             if prev_cache is not None:
-                x = torch.cat([prev_cache, x], dim=split_dim - 1)
-            x = safe_pad_operation(x, padding, mode='constant', value=0.0)
-            with ignore_padding(self):
-                return super().forward(x)
+                x_concat = torch.cat([prev_cache, x], dim=split_dim - 1)
+            
+            def pad_and_forward():
+                padded = safe_pad_operation(x_concat, padding, mode='constant', value=0.0)
+                with ignore_padding(self):
+                    return Conv3d.forward(self, padded)
+            
+            return retry_on_oom(
+                pad_and_forward,
+                debug=getattr(self, 'debug', None),
+                operation_name="InflatedCausalConv3d.pad_and_forward"
+            )
 
         # Exceed memory limit, splitting tensor
 
@@ -119,8 +127,6 @@ class InflatedCausalConv3d(Conv3d):
         x = list(x.split(split_sizes, dim=split_dim))
         if prev_cache is not None:
             prev_cache = list(prev_cache.split(split_sizes, dim=split_dim))
-        if preserve_vram:
-            torch.cuda.empty_cache()
         # Loop Fwd.
         cache = None
         for idx in range(len(x)):
@@ -164,18 +170,13 @@ class InflatedCausalConv3d(Conv3d):
             # Update cache.
             cache = next_cache
 
-        # ADD BY NUMZ
-        if preserve_vram:
-            torch.cuda.empty_cache()
-            #print("empty cache 1")
-            #time.sleep(2)
-        try:
-            output = torch.cat(x, split_dim)
-        except Exception as e:
-            print("OOM second chance")
-            torch.cuda.empty_cache()
-            time.sleep(2)
-            output = torch.cat(x, split_dim)
+        output = retry_on_oom(
+            torch.cat,
+            x,
+            split_dim,
+            debug=getattr(self, 'debug', None),
+            operation_name="InflatedCausalConv3d.concat_splits"
+        )
         return output
 
     def forward(
@@ -350,28 +351,32 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor, preserve_vram: b
                 x = list(x.chunk(num_chunks, dim=1))
                 weights = norm_layer.weight.chunk(num_chunks, dim=0)
                 biases = norm_layer.bias.chunk(num_chunks, dim=0)
+                
                 for i, (w, b) in enumerate(zip(weights, biases)):
-                    try:
-                        x[i] = F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
-                    except Exception as e:
-                        print("OOM Second Chance : Group Norm")
-                        torch.cuda.empty_cache()
-                        time.sleep(2)
-                        x[i] = F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
+                    def apply_group_norm():
+                        return F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
+                    
+                    x[i] = retry_on_oom(
+                        apply_group_norm,
+                        debug=getattr(norm_layer, 'debug', None),
+                        operation_name=f"GroupNorm.chunk_{i}"
+                    )
                     x[i] = x[i].to(input_dtype)
-                # ADD BY NUMZ
-                if preserve_vram:
-                    torch.cuda.empty_cache()
-                # ADD BY NUMZ
-                try:
-                    x = torch.cat(x, dim=1)
-                except Exception as e:
-                    print("OOM Second Chance : Cat")
-                    torch.cuda.empty_cache()
-                    time.sleep(2)
-                    x = torch.cat(x, dim=1)
+                
+                x = retry_on_oom(
+                    torch.cat,
+                    x,
+                    dim=1,
+                    debug=getattr(norm_layer, 'debug', None),
+                    operation_name="GroupNorm.concat_chunks"
+                )
             else:
-                x = norm_layer(x)
+                x = retry_on_oom(
+                    norm_layer,
+                    x,
+                    debug=getattr(norm_layer, 'debug', None),
+                    operation_name="GroupNorm.direct"
+                )
             x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
             return x.to(input_dtype)
     raise NotImplementedError

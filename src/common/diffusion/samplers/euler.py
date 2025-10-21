@@ -21,8 +21,7 @@ from typing import Callable
 import torch
 from einops import rearrange
 from torch.nn import functional as F
-
-#from ....models.dit_v2 import na
+from ....optimization.memory_manager import clear_memory
 
 from ..types import PredictionType
 from ..utils import expand_dims
@@ -44,35 +43,36 @@ class EulerSampler(Sampler):
         progress = self.get_progress_bar()
         i = 0
         
-        # Optimisations VRAM
+        # VRAM optimizations
         original_dtype = x.dtype
         device = x.device
         
-        # Forcer FP16 pour économiser la VRAM
+        # Force FP16 to save VRAM
         if x.dtype != torch.float16:
             x = x.half()
         
         for t, s in zip(timesteps[:-1], timesteps[1:]):
-            # Forcer FP16 pour les timesteps
+            # Force FP16 for timesteps
             if t.dtype != torch.float16:
                 t = t.half()
             if s.dtype != torch.float16:
                 s = s.half()
                 
-            # Appel du modèle avec monitoring
+            # Model call with monitoring
             pred = f(SamplerModelArgs(x, t, i))
             
-            # Forcer FP16 pour la prédiction
+            # Force FP16 for prediction
             if pred.dtype != torch.float16:
                 pred = pred.half()
             
-            # Étape suivante
+            # Next step
             x = self.step_to(pred, x, t, s)
             
-            # Nettoyer les tenseurs temporaires
+            # Clean up temporary tensors
             del pred
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+
+            # Clear memory - only when model is configured with sampling step > 1
+            clear_memory(debug=getattr(self, 'debug', None), deep=False, force=True, timer_name="EulerSampler")
             
             i += 1
             progress.update()
@@ -88,7 +88,7 @@ class EulerSampler(Sampler):
             del pred
             progress.update()
         
-        # Restaurer le dtype original si nécessaire
+        # Restore original dtype if necessary
         if original_dtype != torch.float16:
             x = x.to(original_dtype)
             
@@ -125,3 +125,4 @@ class EulerSampler(Sampler):
         pred_x_s = pred_x_s.where(s >= 0, pred_x_0)
         pred_x_s = pred_x_s.where(s <= T, pred_x_T)
         return pred_x_s
+    

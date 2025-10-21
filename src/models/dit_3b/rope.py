@@ -19,7 +19,7 @@ from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
-from src.common.cache import Cache
+from ...common.cache import Cache
 
 
 class RotaryEmbeddingBase(nn.Module):
@@ -136,8 +136,28 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         torch.Tensor,
         torch.Tensor,
     ]:
-        vid_freqs = self.get_axial_freqs(1024, 128, 128)
-        txt_freqs = self.get_axial_freqs(1024)
+        # Calculate actual max dimensions needed for this batch
+        max_temporal = 0
+        max_height = 0
+        max_width = 0
+        max_txt_len = 0
+        
+        for (f, h, w), l in zip(vid_shape.tolist(), txt_shape[:, 0].tolist()):
+            max_temporal = max(max_temporal, l + f)  # Need up to l+f for temporal
+            max_height = max(max_height, h)
+            max_width = max(max_width, w)
+            max_txt_len = max(max_txt_len, l)
+        
+        # Compute frequencies for actual max dimensions needed
+        # Add small buffer to improve cache hits across similar batches
+        vid_freqs = self.get_axial_freqs(
+            min(max_temporal + 16, 1024),  # Cap at 1024, add small buffer
+            min(max_height + 4, 128),      # Cap at 128, add small buffer  
+            min(max_width + 4, 128)        # Cap at 128, add small buffer
+        )
+        txt_freqs = self.get_axial_freqs(min(max_txt_len + 16, 1024))
+        
+        # Now slice as before
         vid_freq_list, txt_freq_list = [], []
         for (f, h, w), l in zip(vid_shape.tolist(), txt_shape[:, 0].tolist()):
             vid_freq = vid_freqs[l : l + f, :h, :w].reshape(-1, vid_freqs.size(-1))

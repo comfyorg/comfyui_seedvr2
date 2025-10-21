@@ -2,7 +2,7 @@ import torch
 from PIL import Image
 from torch import Tensor
 from torch.nn import functional as F
-from src.common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation
+from ..common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation
 from torchvision.transforms import ToTensor, ToPILImage
 
 def adain_color_fix(target: Image, source: Image):
@@ -20,14 +20,14 @@ def adain_color_fix(target: Image, source: Image):
 
     return result_image
 
-def wavelet_color_fix(target: Image, source: Image):
+def wavelet_color_fix(target: Image, source: Image, debug):
     # Convert images to tensors
     to_tensor = ToTensor()
     target_tensor = to_tensor(target).unsqueeze(0)
     source_tensor = to_tensor(source).unsqueeze(0)
 
     # Apply wavelet reconstruction
-    result_tensor = wavelet_reconstruction(target_tensor, source_tensor)
+    result_tensor = wavelet_reconstruction(target_tensor, source_tensor, debug)
 
     # Convert tensor back to image
     to_image = ToPILImage()
@@ -66,29 +66,35 @@ def adaptive_instance_normalization(content_feat:Tensor, style_feat:Tensor):
 
 def wavelet_blur(image: Tensor, radius: int):
     """
-    Apply wavelet blur to the input tensor.
+    Apply wavelet blur using dilated convolution.
+    Automatically limits radius to prevent numerical instability at high resolutions.
     """
-    # input shape: (1, 3, H, W)
-    # convolution kernel
+    # Prevent excessive dilation that causes OOM/numerical issues
+    # Conservative limit: 1/8 of smallest dimension
+    max_safe_radius = max(1, min(image.shape[-2:]) // 8)
+    if radius > max_safe_radius:
+        radius = max_safe_radius
+    
+    # Create Gaussian-like blur kernel
     kernel_vals = [
         [0.0625, 0.125, 0.0625],
         [0.125, 0.25, 0.125],
         [0.0625, 0.125, 0.0625],
     ]
     kernel = torch.tensor(kernel_vals, dtype=image.dtype, device=image.device)
-    # add channel dimensions to the kernel to make it a 4D tensor
-    kernel = kernel[None, None]
-    # repeat the kernel across all input channels
-    kernel = kernel.repeat(3, 1, 1, 1)
+    kernel = kernel[None, None].repeat(3, 1, 1, 1)
+    
+    # Apply padding and convolution
+    # safe_pad_operation already handles FP16 conversion if needed
     image = safe_pad_operation(image, (radius, radius, radius, radius), mode='replicate')
-    # apply convolution
     output = F.conv2d(image, kernel, groups=3, dilation=radius)
+    
     return output
 
 def wavelet_decomposition(image: Tensor, levels=5):
     """
-    Apply wavelet decomposition to the input tensor.
-    This function only returns the low frequency & the high frequency.
+    Apply wavelet decomposition to extract frequency components.
+    Returns high frequency (detail) and low frequency (color) components.
     """
     high_freq = torch.zeros_like(image)
     for i in range(levels):
@@ -99,38 +105,46 @@ def wavelet_decomposition(image: Tensor, levels=5):
 
     return high_freq, low_freq
 
-
-
-def wavelet_reconstruction(content_feat:Tensor, style_feat:Tensor):
+def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug):
     """
-    Apply wavelet decomposition, so that the content will have the same color as the style.
-    """
-    # Vérifier et ajuster les dimensions si nécessaire
-    if content_feat.shape != style_feat.shape:
-        print(f"⚠️ Dimension mismatch détectée: content {content_feat.shape} vs style {style_feat.shape}")
+    Apply wavelet-based color transfer from style to content.
+    Preserves high-frequency details from content while adopting low-frequency color from style.
+    Note: Operates in normalized [-1,1] space for SDR images.
+    
+    Args:
+        content_feat: Target tensor with desired details [B, C, H, W]
+        style_feat: Source tensor with desired colors [B, C, H, W]  
+        debug: Debug instance for logging
         
-        # Redimensionner style_feat pour correspondre à content_feat
-        target_shape = content_feat.shape
-        if len(target_shape) >= 3:  # Au moins 3 dimensions
-            # Utiliser interpolation pour ajuster les dimensions spatiales
+    Returns:
+        Reconstructed tensor with content details and style colors
+    """
+    # Handle dimension mismatch if needed
+    if content_feat.shape != style_feat.shape:
+        debug.log(f"Dimension mismatch: content {content_feat.shape} vs style {style_feat.shape}", 
+                  level="WARNING", category="precision", force=True)
+        
+        # Resize style to match content spatial dimensions
+        if len(content_feat.shape) >= 3:
+            # safe_interpolate_operation handles FP16 conversion automatically
             style_feat = safe_interpolate_operation(
                 style_feat, 
-                size=target_shape[-2:],  # Dernières 2 dimensions (H, W)
+                size=content_feat.shape[-2:],
                 mode='bilinear', 
                 align_corners=False
             )
-            print(f"✅ Style redimensionné vers: {style_feat.shape}")
+            debug.log(f"Style resized to: {style_feat.shape}", category="precision", force=True)
     
-    # calculate the wavelet decomposition of the content feature
+    # Decompose both features into frequency components
     content_high_freq, content_low_freq = wavelet_decomposition(content_feat)
-    del content_low_freq
-    # calculate the wavelet decomposition of the style feature
-    style_high_freq, style_low_freq = wavelet_decomposition(style_feat)
-    del style_high_freq
+    del content_low_freq  # Free memory immediately
     
-    # Vérification finale avant addition
+    style_high_freq, style_low_freq = wavelet_decomposition(style_feat)  
+    del style_high_freq  # Free memory immediately
+    
+    # Safety check (should not happen after resize)
     if content_high_freq.shape != style_low_freq.shape:
-        print(f"⚠️ Ajustement final nécessaire: {content_high_freq.shape} vs {style_low_freq.shape}")
+        debug.log(f"Final dimension adjustment needed", level="WARNING", category="precision", force=True)
         style_low_freq = safe_interpolate_operation(
             style_low_freq,
             size=content_high_freq.shape[-2:],
@@ -138,5 +152,10 @@ def wavelet_reconstruction(content_feat:Tensor, style_feat:Tensor):
             align_corners=False
         )
     
-    # reconstruct the content feature with the style's high frequency
-    return content_high_freq + style_low_freq
+    # Reconstruct: content details + style color
+    result = content_high_freq + style_low_freq
+    
+    # Safety clamp for normalized SDR range
+    # This prevents numerical errors from propagating
+    # Note: For HDR support, this would need to be removed
+    return torch.clamp(result, -1.0, 1.0)

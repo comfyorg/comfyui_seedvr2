@@ -22,7 +22,6 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-
 def get_global_rank() -> int:
     """
     Get the global rank, the global index of the GPU.
@@ -48,6 +47,8 @@ def get_device() -> torch.device:
     """
     Get current rank device.
     """
+    if torch.mps.is_available():
+        return "mps"
     return torch.device("cuda", get_local_rank())
 
 
@@ -82,3 +83,4 @@ def convert_to_ddp(module: torch.nn.Module, **kwargs) -> DistributedDataParallel
         output_device=get_local_rank(),
         **kwargs,
     )
+    

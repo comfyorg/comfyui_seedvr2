@@ -6,7 +6,7 @@ Extracted from: seedvr2.py (lines 1633-1730)
 """
 
 import torch
-from typing import List, Union
+from typing import List
 
 
 def optimized_video_rearrange(video_tensors: List[torch.Tensor]) -> List[torch.Tensor]:

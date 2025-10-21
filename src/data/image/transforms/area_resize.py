@@ -31,6 +31,8 @@ class AreaResize:
         self.max_area = max_area
         self.downsample_only = downsample_only
         self.interpolation = interpolation
+        if torch.mps.is_available():
+            self.interpolation = InterpolationMode.BILINEAR
 
     def __call__(self, image: Union[torch.Tensor, Image.Image]):
 
@@ -133,3 +135,4 @@ class ScaleResize:
             antialias=antialias,
         )
         return image
+    
